@@ -415,6 +415,17 @@ vkMusic.prototype.browseRoot = function () {
     return defer.promise;
 };
 
+// How much a rendered page actually offers. A section we cannot render comes
+// back with no lists at all, so this must not assume there is a first one -
+// reading lists[0].items on a cached empty section threw, and because the
+// root loads every section, that one throw took the whole catalogue down.
+function countItems(page) {
+    var lists = (page && page.navigation && page.navigation.lists) || [];
+    return lists.reduce(function (sum, list) {
+        return sum + ((list.items && list.items.length) || 0);
+    }, 0);
+}
+
 // A section is a sequence of blocks: a heading block carrying only a title,
 // then a block of track ids or playlist ids referring to the flat audios and
 // playlists arrays alongside. Rendering them in order preserves VK's own
@@ -486,7 +497,7 @@ vkMusic.prototype.loadSection = function (sectionId, curUri) {
 
     var cached = self.browseCache.get(curUri);
     if (cached) {
-        defer.resolve({ page: cached, trackCount: cached.navigation.lists[0].items.length });
+        defer.resolve({ page: cached, trackCount: countItems(cached) });
         return defer.promise;
     }
 
@@ -504,7 +515,7 @@ vkMusic.prototype.loadSection = function (sectionId, curUri) {
 
         // Counts playlists too: a section made only of playlists still has
         // plenty to play and must not be hidden as empty.
-        var total = lists.reduce(function (sum, list) { return sum + list.items.length; }, 0);
+        var total = countItems(page);
 
         self.browseCache.set(curUri, page);
         self.sectionTracks.set(curUri, audios);
