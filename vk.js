@@ -25,14 +25,53 @@ function now() {
 // MPEG-TS wrappers around the same mp3 that sits next to the playlist. Dropping
 // the segment directory gives a plain mp3 url that MPD can play directly.
 // Whether VK still serves those files is the open question - see README.
-function m3u8ToMp3(url) {
+//
+// The two reference implementations rewrite the path identically but disagree
+// about the query string: vodka2's drops it, vk_api's keeps it. Today's urls
+// carry siren and signature parameters, so keepQuery defaults to true.
+function m3u8ToMp3(url, keepQuery) {
     if (!url || url.indexOf('index.m3u8') < 0) {
         return url;
     }
-    if (url.indexOf('/audios/') >= 0) {
-        return url.replace(/^(.+?)\/[^\/]+?\/audios\/([^\/]+)\/.+$/, '$1/audios/$2.mp3');
+
+    var query = '';
+    var base = url;
+    var mark = url.indexOf('?');
+    if (mark >= 0) {
+        query = url.substring(mark);
+        base = url.substring(0, mark);
     }
-    return url.replace(/^(.+?)\/(p[0-9]+)\/[^\/]+?\/([^\/]+)\/.+$/, '$1/$2/$3.mp3');
+
+    var rewritten;
+    if (base.indexOf('/audios/') >= 0) {
+        rewritten = base.replace(/^(.+?)\/[^\/]+?\/audios\/([^\/]+)\/.+$/, '$1/audios/$2.mp3');
+    } else {
+        rewritten = base.replace(/^(.+?)\/(p[0-9]+)\/[^\/]+?\/([^\/]+)\/.+$/, '$1/$2/$3.mp3');
+    }
+
+    // An url shape we do not recognise is left alone rather than mangled.
+    if (rewritten === base) {
+        return url;
+    }
+
+    return (keepQuery === false) ? rewritten : rewritten + query;
+}
+
+// The mp3 urls worth trying for a track, in the order they should be tried,
+// most likely first. Empty if the playlist url is of an unknown shape.
+function mp3Candidates(url) {
+    var withQuery = m3u8ToMp3(url, true);
+    var withoutQuery = m3u8ToMp3(url, false);
+    var candidates = [];
+
+    if (withQuery !== url) {
+        candidates.push(withQuery);
+    }
+    if (withoutQuery !== url && withoutQuery !== withQuery) {
+        candidates.push(withoutQuery);
+    }
+
+    return candidates;
 }
 
 function VKClient(cookieP, remixsid, logger) {
@@ -167,5 +206,6 @@ VKClient.prototype.remove = function (ownerId, audioId) {
 
 module.exports = {
     VKClient: VKClient,
-    m3u8ToMp3: m3u8ToMp3
+    m3u8ToMp3: m3u8ToMp3,
+    mp3Candidates: mp3Candidates
 };
