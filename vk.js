@@ -208,6 +208,15 @@ VKClient.prototype.getSection = function (sectionId, startFrom) {
     });
 };
 
+// Playlist urls are signed and short lived, so a track queued earlier has to
+// be looked up again at the moment it plays rather than reusing a stored url.
+// ids is one "ownerId_audioId" or an array of them.
+VKClient.prototype.getById = function (ids) {
+    return this.request('audio.getById', {
+        audios: Array.isArray(ids) ? ids.join(',') : String(ids)
+    });
+};
+
 VKClient.prototype.search = function (query, offset) {
     return this.request('audio.search', {
         q: query,

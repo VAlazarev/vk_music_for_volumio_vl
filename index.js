@@ -3,7 +3,14 @@
 var libQ = require('kew');
 var fs = require('fs-extra');
 var NodeCache = require('node-cache');
+var querystring = require('querystring');
 var vk = require('./vk.js');
+var Proxy = require('./proxy.js');
+
+// MPD fetches every track through our own proxy, which assembles and decrypts
+// the HLS stream and remuxes it to MP3. 6601 is taken by the Yandex plugin on
+// the same device.
+const PROXY_PORT = 6602;
 
 module.exports = vkMusic;
 
@@ -19,6 +26,7 @@ function vkMusic(context) {
 
     self.client = false;
     self.current_track = false;
+    self.proxy = new Proxy(self.logger);
 }
 
 vkMusic.prototype.onVolumioStart = function () {
@@ -38,6 +46,7 @@ vkMusic.prototype.onStart = function () {
     self.addToBrowseSources();
     self.mpdPlugin = self.commandRouter.pluginManager.getPlugin('music_service', 'mpd');
     self.initClient();
+    self.proxy.start(PROXY_PORT);
 
     return libQ.resolve();
 };
@@ -47,6 +56,7 @@ vkMusic.prototype.onStop = function () {
 
     self.commandRouter.volumioRemoveToBrowseSources(self.getI18n('VKM'));
     self.browseCache.flushAll();
+    self.proxy.stop();
     self.client = false;
 
     return libQ.resolve();
@@ -178,15 +188,83 @@ vkMusic.prototype.addToBrowseSources = function () {
     });
 };
 
+// VK addresses a track by owner and id together; both are needed to play it
+// or to add it to My music.
+function trackUri(audio) {
+    return 'vk_music/track/' + audio.owner_id + '_' + audio.id;
+}
+
+function thumbOf(audio) {
+    var thumb = audio.thumb || (audio.album && audio.album.thumb);
+    if (!thumb) {
+        return '/albumart';
+    }
+    return thumb.photo_300 || thumb.photo_270 || thumb.photo_600 || thumb.photo_135 || '/albumart';
+}
+
+function trackItem(audio) {
+    return {
+        service: 'vk_music',
+        type: 'song',
+        title: audio.title,
+        artist: audio.artist,
+        album: audio.album ? audio.album.title : '',
+        duration: audio.duration,
+        albumart: thumbOf(audio),
+        uri: trackUri(audio)
+    };
+}
+
 vkMusic.prototype.handleBrowseUri = function (curUri) {
     var self = this;
 
     if (curUri === 'vk_music') {
         return self.browseRoot();
     }
+    if (curUri.indexOf('vk_music/section/') === 0) {
+        return self.browseSection(curUri.substring('vk_music/section/'.length), curUri);
+    }
 
-    // TODO: sections, playlists, VK Mix and search results.
-    return libQ.reject(new Error('VK Music: browsing "' + curUri + '" is not implemented yet'));
+    return libQ.reject(new Error('VK Music: неизвестный адрес "' + curUri + '"'));
+};
+
+vkMusic.prototype.browseSection = function (sectionId, curUri) {
+    var self = this;
+    var defer = libQ.defer();
+
+    if (!self.client && !self.initClient()) {
+        defer.reject(new Error(self.getI18n('LOGIN_FAILED_NO_COOKIES')));
+        return defer.promise;
+    }
+
+    var cached = self.browseCache.get(curUri);
+    if (cached) {
+        defer.resolve(cached);
+        return defer.promise;
+    }
+
+    self.client.getSection(sectionId).then(function (response) {
+        var audios = response.audios || [];
+        var page = {
+            navigation: {
+                lists: [{
+                    title: response.section ? response.section.title : '',
+                    availableListViews: ['list'],
+                    items: audios.map(trackItem)
+                }],
+                prev: { uri: 'vk_music' }
+            }
+        };
+
+        self.storeToken();
+        self.browseCache.set(curUri, page);
+        defer.resolve(page);
+    }).fail(function (err) {
+        self.logger.error('VK Music: browseSection failed: ' + err);
+        defer.reject(err);
+    });
+
+    return defer.promise;
 };
 
 // The catalogue root. VK returns the same section list the web player shows
@@ -240,39 +318,174 @@ vkMusic.prototype.browseRoot = function () {
 };
 
 vkMusic.prototype.search = function (query) {
-    // TODO: map audio.search onto Volumio's search result sections.
-    return libQ.resolve([]);
+    var self = this;
+    var defer = libQ.defer();
+
+    if (!self.client && !self.initClient()) {
+        defer.resolve([]);
+        return defer.promise;
+    }
+
+    self.client.search(query.value, 0).then(function (found) {
+        var audios = found.items || [];
+        if (!audios.length) {
+            defer.resolve([]);
+            return;
+        }
+        defer.resolve([{
+            type: 'title',
+            title: self.getI18n('SEARCH_RESULTS') + ' - ' + self.getI18n('SEARCH_SONGS_SECTION'),
+            availableListViews: ['list'],
+            items: audios.map(trackItem)
+        }]);
+    }).fail(function (err) {
+        self.logger.error('VK Music: search failed: ' + err);
+        defer.resolve([]);
+    });
+
+    return defer.promise;
 };
 
 // ---------------------------------------------------------------- playback
 
-vkMusic.prototype.explodeUri = function (uri) {
-    // TODO: resolve a track uri into a Volumio track object. Blocked on the
-    // streaming question - see README, "Как проигрывать".
-    return libQ.reject(new Error('VK Music: playback is not implemented yet'));
+// Turns a track id into something MPD can fetch. The signed playlist url is
+// resolved fresh every time, because it expires.
+vkMusic.prototype.resolveTrack = function (id) {
+    var self = this;
+    var defer = libQ.defer();
+
+    if (!self.client && !self.initClient()) {
+        defer.reject(new Error(self.getI18n('LOGIN_FAILED_NO_COOKIES')));
+        return defer.promise;
+    }
+
+    self.client.getById(id).then(function (response) {
+        var audio = Array.isArray(response) ? response[0] : (response && response.items ? response.items[0] : response);
+        if (!audio) {
+            defer.reject(new Error('VK Music: трек ' + id + ' не найден'));
+            return;
+        }
+        if (!audio.url) {
+            defer.reject(new Error('VK Music: у трека ' + id + ' нет ссылки - возможно, он недоступен'));
+            return;
+        }
+        self.storeToken();
+        defer.resolve(audio);
+    }).fail(function (err) {
+        defer.reject(err);
+    });
+
+    return defer.promise;
 };
 
-vkMusic.prototype.clearAddPlayTracks = function (track) {
-    return libQ.reject(new Error('VK Music: playback is not implemented yet'));
+// The .mp3 in the path is cosmetic - it lets MPD and the UI recognise the
+// format from the url; the proxy serves whatever the query asks for.
+function proxyUrl(playlistUrl) {
+    return 'http://127.0.0.1:' + PROXY_PORT + '/track.mp3?' + querystring.stringify({ url: playlistUrl });
+}
+
+vkMusic.prototype.explodeUri = function (curUri) {
+    var self = this;
+    var defer = libQ.defer();
+
+    if (curUri.indexOf('vk_music/track/') !== 0) {
+        defer.reject(new Error('VK Music: нечего проигрывать по адресу "' + curUri + '"'));
+        return defer.promise;
+    }
+
+    self.resolveTrack(curUri.substring('vk_music/track/'.length)).then(function (audio) {
+        defer.resolve([{
+            uri: trackUri(audio),
+            service: 'vk_music',
+            name: audio.title,
+            title: audio.title,
+            artist: audio.artist,
+            album: audio.album ? audio.album.title : '',
+            type: 'track',
+            duration: audio.duration,
+            albumart: thumbOf(audio),
+            trackType: 'mp3'
+        }]);
+    }).fail(function (err) {
+        self.logger.error('VK Music: explodeUri failed: ' + err);
+        defer.reject(err);
+    });
+
+    return defer.promise;
+};
+
+vkMusic.prototype.clearAddPlayTrack = function (track) {
+    var self = this;
+
+    return self.mpdPlugin.sendMpdCommand('stop', [])
+        .then(function () {
+            return self.mpdPlugin.sendMpdCommand('clear', []);
+        })
+        .then(function () {
+            return self.resolveTrack(track.uri.substring('vk_music/track/'.length));
+        })
+        .then(function (audio) {
+            return self.mpdPlugin.sendMpdCommand('addid "' + proxyUrl(audio.url) + '"', []);
+        })
+        .then(function (resp) {
+            if (resp && resp.Id !== undefined) {
+                return self.mpdPlugin.sendMpdCommandArray([
+                    { command: 'addtagid', parameters: [resp.Id, 'title', track.title] },
+                    { command: 'addtagid', parameters: [resp.Id, 'album', track.album] },
+                    { command: 'addtagid', parameters: [resp.Id, 'artist', track.artist] }
+                ]);
+            }
+            return libQ.resolve();
+        })
+        .then(function () {
+            // ignoremeta keeps Volumio reporting this service and uri from the
+            // queue rather than from MPD, which is what lets next/previous and
+            // the heart button reach this plugin at all. Same trade-off as in
+            // the Yandex plugin: live samplerate and bitdepth stop showing.
+            self.commandRouter.stateMachine.setConsumeUpdateService('mpd', true);
+            return self.mpdPlugin.sendMpdCommand('play', []);
+        });
 };
 
 vkMusic.prototype.stop = function () {
     var self = this;
+
+    self.commandRouter.stateMachine.setConsumeUpdateService('mpd', true);
     return self.mpdPlugin.stop();
 };
 
 vkMusic.prototype.pause = function () {
     var self = this;
+
+    self.commandRouter.stateMachine.setConsumeUpdateService('mpd', true);
     return self.mpdPlugin.pause();
 };
 
 vkMusic.prototype.resume = function () {
     var self = this;
+
+    self.commandRouter.stateMachine.setConsumeUpdateService('mpd', true);
     return self.mpdPlugin.resume();
 };
 
+vkMusic.prototype.next = function () {
+    var self = this;
+
+    self.commandRouter.stateMachine.setConsumeUpdateService('mpd', true);
+    return self.mpdPlugin.next();
+};
+
+vkMusic.prototype.previous = function () {
+    var self = this;
+
+    self.commandRouter.stateMachine.setConsumeUpdateService('mpd', true);
+    return self.mpdPlugin.previous();
+};
+
+// The stream has no Content-Length and cannot be seeked; see README.
 vkMusic.prototype.seek = function (position) {
     var self = this;
+
     return self.mpdPlugin.seek(position);
 };
 
