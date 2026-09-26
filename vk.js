@@ -261,6 +261,25 @@ VKClient.prototype.getById = function (ids) {
     });
 };
 
+// A playlist's tracks. Playlists owned by someone else need the access_key
+// that came with them in the listing.
+VKClient.prototype.getPlaylist = function (ownerId, playlistId, accessKey, count) {
+    return this.request('audio.get', {
+        owner_id: String(ownerId),
+        album_id: String(playlistId),
+        access_key: accessKey || undefined,
+        count: String(count || 200)
+    });
+};
+
+// Popular tracks, optionally narrowed to one of VK's genre ids.
+VKClient.prototype.getPopular = function (genreId, count) {
+    return this.request('audio.getPopular', {
+        genre_id: (genreId === undefined) ? undefined : String(genreId),
+        count: String(count || 100)
+    });
+};
+
 VKClient.prototype.search = function (query, offset) {
     return this.request('audio.search', {
         q: query,

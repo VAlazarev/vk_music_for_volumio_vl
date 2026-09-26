@@ -210,6 +210,30 @@ function thumbOf(audio) {
     return thumb.photo_300 || thumb.photo_270 || thumb.photo_600 || thumb.photo_135 || '/albumart';
 }
 
+function playlistUri(playlist) {
+    return 'vk_music/playlist/' + playlist.owner_id + '_' + playlist.id +
+           (playlist.access_key ? '_' + playlist.access_key : '');
+}
+
+function playlistArt(playlist) {
+    var photo = playlist.photo || (playlist.thumbs && playlist.thumbs[0]);
+    if (!photo) {
+        return '/albumart?sourceicon=music_service/vk_music/icons/playlist.png';
+    }
+    return photo.photo_300 || photo.photo_270 || photo.photo_600 || '/albumart';
+}
+
+function playlistItem(playlist) {
+    return {
+        service: 'vk_music',
+        type: 'folder',
+        title: playlist.title,
+        artist: playlist.subtitle || '',
+        albumart: playlistArt(playlist),
+        uri: playlistUri(playlist)
+    };
+}
+
 function trackItem(audio) {
     return {
         service: 'vk_music',
@@ -240,8 +264,69 @@ vkMusic.prototype.handleBrowseUri = function (curUri) {
     if (curUri.indexOf('vk_music/section/') === 0) {
         return self.browseSection(curUri.substring('vk_music/section/'.length), curUri);
     }
+    if (curUri.indexOf('vk_music/playlist/') === 0) {
+        return self.browsePlaylist(curUri);
+    }
 
     return libQ.reject(new Error('VK Music: неизвестный адрес "' + curUri + '"'));
+};
+
+// owner and playlist ids are numbers and the key has no underscores, so the
+// uri splits cleanly - the owner id may be negative for community playlists.
+function parsePlaylistUri(curUri) {
+    var parts = curUri.substring('vk_music/playlist/'.length).split('_');
+    return { ownerId: parts[0], playlistId: parts[1], accessKey: parts[2] || '' };
+}
+
+vkMusic.prototype.loadPlaylist = function (curUri) {
+    var self = this;
+    var defer = libQ.defer();
+
+    var cached = self.sectionTracks.get(curUri);
+    if (cached) {
+        defer.resolve(cached);
+        return defer.promise;
+    }
+
+    if (!self.client && !self.initClient()) {
+        defer.reject(new Error(self.getI18n('LOGIN_FAILED_NO_COOKIES')));
+        return defer.promise;
+    }
+
+    var ref = parsePlaylistUri(curUri);
+    self.client.getPlaylist(ref.ownerId, ref.playlistId, ref.accessKey).then(function (response) {
+        var audios = response.items || [];
+        self.rememberTracks(audios);
+        self.sectionTracks.set(curUri, audios);
+        self.storeToken();
+        defer.resolve(audios);
+    }).fail(function (err) {
+        self.logger.error('VK Music: плейлист ' + curUri + ' не загрузился: ' + err);
+        defer.reject(err);
+    });
+
+    return defer.promise;
+};
+
+vkMusic.prototype.browsePlaylist = function (curUri) {
+    var self = this;
+    var defer = libQ.defer();
+
+    self.loadPlaylist(curUri).then(function (audios) {
+        defer.resolve({
+            navigation: {
+                lists: [{
+                    availableListViews: ['list'],
+                    items: audios.map(trackItem)
+                }],
+                prev: { uri: 'vk_music' }
+            }
+        });
+    }).fail(function (err) {
+        defer.reject(err);
+    });
+
+    return defer.promise;
 };
 
 vkMusic.prototype.browseSection = function (sectionId, curUri) {
@@ -330,6 +415,68 @@ vkMusic.prototype.browseRoot = function () {
     return defer.promise;
 };
 
+// A section is a sequence of blocks: a heading block carrying only a title,
+// then a block of track ids or playlist ids referring to the flat audios and
+// playlists arrays alongside. Rendering them in order preserves VK's own
+// grouping - "Выбор редакции", "Новинки по жанрам" and the rest - instead of
+// flattening everything into one anonymous list.
+vkMusic.prototype.sectionLists = function (response) {
+    var self = this;
+
+    var audios = {};
+    (response.audios || []).forEach(function (audio) {
+        audios[audio.owner_id + '_' + audio.id] = audio;
+    });
+    var playlists = {};
+    (response.playlists || []).forEach(function (playlist) {
+        playlists[playlist.owner_id + '_' + playlist.id] = playlist;
+    });
+
+    var blocks = (response.section && response.section.blocks) || [];
+    var lists = [];
+    var heading = '';
+
+    blocks.forEach(function (block) {
+        var title = block.layout && block.layout.title;
+
+        if (block.data_type === 'music_audios') {
+            var tracks = (block.audios_ids || []).map(function (id) { return audios[id]; }).filter(Boolean);
+            if (tracks.length) {
+                lists.push({
+                    title: heading || title || '',
+                    availableListViews: ['list'],
+                    items: tracks.map(trackItem)
+                });
+                heading = '';
+            }
+        } else if (block.data_type === 'music_playlists') {
+            var found = (block.playlists_ids || []).map(function (id) { return playlists[id]; }).filter(Boolean);
+            if (found.length) {
+                lists.push({
+                    title: heading || title || '',
+                    availableListViews: ['list', 'grid'],
+                    items: found.map(playlistItem)
+                });
+                heading = '';
+            }
+        } else if (title) {
+            // A heading block, which labels whatever block comes next.
+            heading = title;
+        }
+    });
+
+    // A section whose blocks we do not understand still shows its tracks.
+    if (!lists.length && (response.audios || []).length) {
+        lists.push({
+            title: (response.section && response.section.title) || '',
+            availableListViews: ['list'],
+            items: response.audios.map(trackItem)
+        });
+    }
+
+    return lists;
+};
+
 // Fetches a section once and caches both its rendered page and its tracks.
 // A section that cannot be loaded is reported as empty rather than failing
 // the whole root listing.
@@ -347,20 +494,21 @@ vkMusic.prototype.loadSection = function (sectionId, curUri) {
         var audios = response.audios || [];
         self.rememberTracks(audios);
 
+        var lists = self.sectionLists(response);
         var page = {
             navigation: {
-                lists: [{
-                    title: response.section ? response.section.title : '',
-                    availableListViews: ['list'],
-                    items: audios.map(trackItem)
-                }],
+                lists: lists,
                 prev: { uri: 'vk_music' }
             }
         };
 
+        // Counts playlists too: a section made only of playlists still has
+        // plenty to play and must not be hidden as empty.
+        var total = lists.reduce(function (sum, list) { return sum + list.items.length; }, 0);
+
         self.browseCache.set(curUri, page);
         self.sectionTracks.set(curUri, audios);
-        defer.resolve({ page: page, trackCount: audios.length });
+        defer.resolve({ page: page, trackCount: total });
     }).fail(function (err) {
         self.logger.error('VK Music: раздел ' + sectionId + ' не загрузился: ' + err);
         defer.resolve({ page: false, trackCount: 0 });
@@ -455,6 +603,15 @@ function queueEntry(audio) {
 vkMusic.prototype.explodeUri = function (curUri) {
     var self = this;
     var defer = libQ.defer();
+
+    if (curUri.indexOf('vk_music/playlist/') === 0) {
+        self.loadPlaylist(curUri).then(function (audios) {
+            defer.resolve(audios.map(queueEntry));
+        }).fail(function (err) {
+            defer.reject(err);
+        });
+        return defer.promise;
+    }
 
     // Hitting play on a section queues the whole thing.
     if (curUri.indexOf('vk_music/section/') === 0) {
