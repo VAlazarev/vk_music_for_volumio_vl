@@ -17,6 +17,12 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20
 // Refresh the access token this many seconds before it actually expires.
 const REFRESH_THRESHOLD = 600;
 
+// VK rejects bursts with "Too many requests per second". Volumio explodes a
+// queue one track at a time and will happily fire a hundred calls at once, so
+// requests are spaced out and a rejected one is retried rather than lost.
+const MIN_REQUEST_GAP = 400;
+const RETRY_DELAYS = [700, 1500, 3000];
+
 function now() {
     return Math.floor(Date.now() / 1000);
 }
@@ -98,6 +104,7 @@ function VKClient(cookieP, remixsid, logger) {
     self.logger = logger;
     self.token = '';
     self.expires = 0;
+    self.nextSlot = 0;
 }
 
 // Trades the browser cookies for a short-lived access token. The cookies
@@ -154,7 +161,39 @@ VKClient.prototype.ensureToken = function () {
     return self.refresh();
 };
 
+// Spaces calls out so a burst does not trip VK's rate limit, and retries the
+// ones that trip it anyway. Everything else fails through untouched.
 VKClient.prototype.request = function (method, params) {
+    var self = this;
+    var defer = libQ.defer();
+
+    function attempt(retry) {
+        var now = Date.now();
+        var slot = Math.max(now, self.nextSlot);
+        self.nextSlot = slot + MIN_REQUEST_GAP;
+
+        setTimeout(function () {
+            self.requestOnce(method, params).then(function (result) {
+                defer.resolve(result);
+            }).fail(function (err) {
+                // VK reports the limit two different ways: as an error object
+                // inside a 200 response, and as a bare HTTP 429.
+                if (err && err.tooFast && retry < RETRY_DELAYS.length) {
+                    self.nextSlot = Date.now() + RETRY_DELAYS[retry];
+                    attempt(retry + 1);
+                    return;
+                }
+                defer.reject(err);
+            });
+        }, slot - now);
+    }
+
+    attempt(0);
+
+    return defer.promise;
+};
+
+VKClient.prototype.requestOnce = function (method, params) {
     var self = this;
     var defer = libQ.defer();
 
@@ -178,12 +217,17 @@ VKClient.prototype.request = function (method, params) {
         }).then(function (resp) {
             var data = resp.data;
             if (!data || data.error) {
-                defer.reject(new Error('VK API ' + method + ': ' + ((data && data.error && data.error.error_msg) || 'unknown error')));
+                var message = (data && data.error && data.error.error_msg) || 'unknown error';
+                var failure = new Error('VK API ' + method + ': ' + message);
+                failure.tooFast = message.indexOf('Too many requests') >= 0;
+                defer.reject(failure);
                 return;
             }
             defer.resolve(data.response);
         }).catch(function (err) {
-            defer.reject(new Error(err));
+            var failure = new Error('VK API ' + method + ': ' + err);
+            failure.tooFast = !!(err && err.response && err.response.status === 429);
+            defer.reject(failure);
         });
     }).fail(function (err) {
         defer.reject(new Error(err));

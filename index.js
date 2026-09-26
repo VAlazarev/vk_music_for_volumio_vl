@@ -23,6 +23,14 @@ function vkMusic(context) {
     self.configManager = self.context.configManager;
 
     self.browseCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+    // Metadata of every track we have listed. Volumio explodes a queue one
+    // track at a time, so adding a whole section means one explodeUri per
+    // track; going to the API for each of those trips VK's rate limit, and
+    // the listing we came from already holds everything explodeUri needs.
+    self.trackCache = new NodeCache({ stdTTL: 7200, checkperiod: 300 });
+    // A section's tracks in order, so "play this whole section" does not have
+    // to fetch it again.
+    self.sectionTracks = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 
     self.client = false;
     self.current_track = false;
@@ -215,6 +223,14 @@ function trackItem(audio) {
     };
 }
 
+vkMusic.prototype.rememberTracks = function (audios) {
+    var self = this;
+
+    audios.forEach(function (audio) {
+        self.trackCache.set(audio.owner_id + '_' + audio.id, audio);
+    });
+};
+
 vkMusic.prototype.handleBrowseUri = function (curUri) {
     var self = this;
 
@@ -237,30 +253,14 @@ vkMusic.prototype.browseSection = function (sectionId, curUri) {
         return defer.promise;
     }
 
-    var cached = self.browseCache.get(curUri);
-    if (cached) {
-        defer.resolve(cached);
-        return defer.promise;
-    }
-
-    self.client.getSection(sectionId).then(function (response) {
-        var audios = response.audios || [];
-        var page = {
-            navigation: {
-                lists: [{
-                    title: response.section ? response.section.title : '',
-                    availableListViews: ['list'],
-                    items: audios.map(trackItem)
-                }],
-                prev: { uri: 'vk_music' }
-            }
-        };
-
+    self.loadSection(sectionId, curUri).then(function (loaded) {
+        if (!loaded.page) {
+            defer.reject(new Error('VK Music: раздел не загрузился'));
+            return;
+        }
         self.storeToken();
-        self.browseCache.set(curUri, page);
-        defer.resolve(page);
+        defer.resolve(loaded.page);
     }).fail(function (err) {
-        self.logger.error('VK Music: browseSection failed: ' + err);
         defer.reject(err);
     });
 
@@ -286,32 +286,84 @@ vkMusic.prototype.browseRoot = function () {
 
     self.client.getSections(undefined, true).then(function (response) {
         var sections = (response.catalog && response.catalog.sections) || [];
-        var items = sections.map(function (section) {
-            return {
-                service: 'vk_music',
-                type: 'folder',
-                title: section.title,
-                uri: 'vk_music/section/' + section.id,
-                albumart: '/albumart?sourceicon=music_service/vk_music/icons/playlist.png'
+
+        // Not every section holds tracks: Radio is a hundred internet radio
+        // stations and Updates comes back as placeholders. Both render as an
+        // empty screen, so the root only lists sections that actually have
+        // something to play. Loading them here also warms the cache, so
+        // opening one afterwards costs no request.
+        return libQ.all(sections.map(function (section) {
+            return self.loadSection(section.id, 'vk_music/section/' + section.id);
+        })).then(function (loaded) {
+            var items = [];
+            sections.forEach(function (section, i) {
+                if (loaded[i].trackCount > 0) {
+                    items.push({
+                        service: 'vk_music',
+                        type: 'folder',
+                        title: section.title,
+                        uri: 'vk_music/section/' + section.id,
+                        albumart: '/albumart?sourceicon=music_service/vk_music/icons/playlist.png'
+                    });
+                }
+            });
+
+            var page = {
+                navigation: {
+                    lists: [{
+                        availableListViews: ['list', 'grid'],
+                        items: items
+                    }],
+                    prev: { uri: '/' }
+                }
             };
+
+            self.storeToken();
+            self.browseCache.set('root', page);
+            defer.resolve(page);
         });
+    }).fail(function (err) {
+        self.logger.error('VK Music: browseRoot failed: ' + err);
+        defer.reject(err);
+    });
+
+    return defer.promise;
+};
+
+// Fetches a section once and caches both its rendered page and its tracks.
+// A section that cannot be loaded is reported as empty rather than failing
+// the whole root listing.
+vkMusic.prototype.loadSection = function (sectionId, curUri) {
+    var self = this;
+    var defer = libQ.defer();
+
+    var cached = self.browseCache.get(curUri);
+    if (cached) {
+        defer.resolve({ page: cached, trackCount: cached.navigation.lists[0].items.length });
+        return defer.promise;
+    }
+
+    self.client.getSection(sectionId).then(function (response) {
+        var audios = response.audios || [];
+        self.rememberTracks(audios);
 
         var page = {
             navigation: {
                 lists: [{
-                    availableListViews: ['list', 'grid'],
-                    items: items
+                    title: response.section ? response.section.title : '',
+                    availableListViews: ['list'],
+                    items: audios.map(trackItem)
                 }],
-                prev: { uri: '/' }
+                prev: { uri: 'vk_music' }
             }
         };
 
-        self.storeToken();
-        self.browseCache.set('root', page);
-        defer.resolve(page);
+        self.browseCache.set(curUri, page);
+        self.sectionTracks.set(curUri, audios);
+        defer.resolve({ page: page, trackCount: audios.length });
     }).fail(function (err) {
-        self.logger.error('VK Music: browseRoot failed: ' + err);
-        defer.reject(err);
+        self.logger.error('VK Music: раздел ' + sectionId + ' не загрузился: ' + err);
+        defer.resolve({ page: false, trackCount: 0 });
     });
 
     return defer.promise;
@@ -332,6 +384,7 @@ vkMusic.prototype.search = function (query) {
             defer.resolve([]);
             return;
         }
+        self.rememberTracks(audios);
         defer.resolve([{
             type: 'title',
             title: self.getI18n('SEARCH_RESULTS') + ' - ' + self.getI18n('SEARCH_SONGS_SECTION'),
@@ -384,28 +437,56 @@ function proxyUrl(playlistUrl) {
     return 'http://127.0.0.1:' + PROXY_PORT + '/track.mp3?' + querystring.stringify({ url: playlistUrl });
 }
 
+function queueEntry(audio) {
+    return {
+        uri: trackUri(audio),
+        service: 'vk_music',
+        name: audio.title,
+        title: audio.title,
+        artist: audio.artist,
+        album: audio.album ? audio.album.title : '',
+        type: 'track',
+        duration: audio.duration,
+        albumart: thumbOf(audio),
+        trackType: 'mp3'
+    };
+}
+
 vkMusic.prototype.explodeUri = function (curUri) {
     var self = this;
     var defer = libQ.defer();
+
+    // Hitting play on a section queues the whole thing.
+    if (curUri.indexOf('vk_music/section/') === 0) {
+        var sectionId = curUri.substring('vk_music/section/'.length);
+        self.loadSection(sectionId, curUri).then(function (loaded) {
+            var audios = self.sectionTracks.get(curUri) || [];
+            defer.resolve(audios.map(queueEntry));
+        }).fail(function (err) {
+            self.logger.error('VK Music: explodeUri section failed: ' + err);
+            defer.reject(err);
+        });
+        return defer.promise;
+    }
 
     if (curUri.indexOf('vk_music/track/') !== 0) {
         defer.reject(new Error('VK Music: нечего проигрывать по адресу "' + curUri + '"'));
         return defer.promise;
     }
 
-    self.resolveTrack(curUri.substring('vk_music/track/'.length)).then(function (audio) {
-        defer.resolve([{
-            uri: trackUri(audio),
-            service: 'vk_music',
-            name: audio.title,
-            title: audio.title,
-            artist: audio.artist,
-            album: audio.album ? audio.album.title : '',
-            type: 'track',
-            duration: audio.duration,
-            albumart: thumbOf(audio),
-            trackType: 'mp3'
-        }]);
+    var id = curUri.substring('vk_music/track/'.length);
+
+    // The playlist url is not needed here - clearAddPlayTrack fetches a fresh
+    // one when the track actually plays - so a listed track costs no request.
+    var known = self.trackCache.get(id);
+    if (known) {
+        defer.resolve([queueEntry(known)]);
+        return defer.promise;
+    }
+
+    self.resolveTrack(id).then(function (audio) {
+        self.trackCache.set(id, audio);
+        defer.resolve([queueEntry(audio)]);
     }).fail(function (err) {
         self.logger.error('VK Music: explodeUri failed: ' + err);
         defer.reject(err);
