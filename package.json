@@ -1,0 +1,24 @@
+{
+	"name": "vk_music",
+	"version": "0.0.1",
+	"description": "VK Music plugin for Volumio",
+	"main": "index.js",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"author": "VAlazarev",
+	"license": "ISC",
+	"volumio_info": {
+		"prettyName": "VK Music",
+		"icon": "fa-music",
+		"plugin_type": "music_service"
+	},
+	"dependencies": {
+		"axios": "^0.27.2",
+		"fs-extra": "^0.28.0",
+		"kew": "^0.7.0",
+		"node-cache": "^4.1.1",
+		"querystring": "^0.2.1",
+		"v-conf": "^1.4.0"
+	}
+}

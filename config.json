@@ -1,0 +1,18 @@
+{
+  "cookie_p": {
+    "type": "string",
+    "value": ""
+  },
+  "remixsid": {
+    "type": "string",
+    "value": ""
+  },
+  "access_token": {
+    "type": "string",
+    "value": ""
+  },
+  "token_expires": {
+    "type": "number",
+    "value": 0
+  }
+}

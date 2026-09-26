@@ -1,0 +1,42 @@
+{
+  "page": {
+    "label": "TRANSLATE.VKM_CONFIGURATION"
+  },
+  "sections": [
+  {
+    "id": "section_account",
+    "element": "section",
+    "label": "TRANSLATE.VKM_ACCOUNT",
+    "onSave": {
+      "type": "controller",
+      "endpoint": "music_service/vk_music",
+      "method": "accountLogin"
+    },
+    "saveButton": {
+      "label": "TRANSLATE.LOGIN",
+      "data": [
+        "cookie_p",
+        "remixsid"
+      ]
+    },
+    "content": [
+      {
+        "id": "cookie_p",
+        "type": "password",
+        "element": "input",
+        "description": "TRANSLATE.COOKIE_P_TIP",
+        "label": "TRANSLATE.COOKIE_P",
+        "value": ""
+      },
+      {
+        "id": "remixsid",
+        "type": "password",
+        "element": "input",
+        "description": "TRANSLATE.REMIXSID_TIP",
+        "label": "TRANSLATE.REMIXSID",
+        "value": ""
+      }
+    ]
+  }
+  ]
+}

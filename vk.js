@@ -1,0 +1,171 @@
+'use strict';
+
+var libQ = require('kew');
+var axios = require('axios');
+var querystring = require('querystring');
+
+// VK's public audio API was closed to third parties in 2016, so we talk to the
+// same private endpoints the web player uses. The app id below is the one the
+// web player itself presents; api.vk.com still answers, but vk.ru is what the
+// current client targets.
+const API_BASE = 'https://api.vk.ru/method/';
+const AUTH_URL = 'https://login.vk.ru/?act=web_token';
+const APP_ID = '6287487';
+const API_VERSION = '5.282';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0';
+
+// Refresh the access token this many seconds before it actually expires.
+const REFRESH_THRESHOLD = 600;
+
+function now() {
+    return Math.floor(Date.now() / 1000);
+}
+
+// VK hands out an HLS playlist for every track, but the segments are just
+// MPEG-TS wrappers around the same mp3 that sits next to the playlist. Dropping
+// the segment directory gives a plain mp3 url that MPD can play directly.
+// Whether VK still serves those files is the open question - see README.
+function m3u8ToMp3(url) {
+    if (!url || url.indexOf('index.m3u8') < 0) {
+        return url;
+    }
+    if (url.indexOf('/audios/') >= 0) {
+        return url.replace(/^(.+?)\/[^\/]+?\/audios\/([^\/]+)\/.+$/, '$1/audios/$2.mp3');
+    }
+    return url.replace(/^(.+?)\/(p[0-9]+)\/[^\/]+?\/([^\/]+)\/.+$/, '$1/$2/$3.mp3');
+}
+
+function VKClient(cookieP, remixsid, logger) {
+    var self = this;
+
+    self.cookieP = cookieP;
+    self.remixsid = remixsid;
+    self.logger = logger;
+    self.token = '';
+    self.expires = 0;
+}
+
+// Trades the browser cookies for a short-lived access token. The cookies
+// themselves last 50+ days, so this is the only step the user has to repeat
+// by hand, and only twice a year.
+VKClient.prototype.refresh = function () {
+    var self = this;
+    var defer = libQ.defer();
+
+    axios({
+        method: 'post',
+        url: AUTH_URL,
+        headers: {
+            'user-agent': USER_AGENT,
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://vk.ru',
+            'referer': 'https://vk.ru/',
+            'cookie': 'p=' + self.cookieP + '; remixsid=' + self.remixsid
+        },
+        data: querystring.stringify({ version: '1', app_id: APP_ID })
+    }).then(function (resp) {
+        var data = resp.data;
+        if (!data || data.type === 'error' || !data.data) {
+            defer.reject(new Error('VK token refresh failed: ' + ((data && data.error_info) || 'unknown error')));
+            return;
+        }
+        self.token = data.data.access_token;
+        self.expires = data.data.expires;
+        defer.resolve({ token: self.token, expires: self.expires });
+    }).catch(function (err) {
+        defer.reject(new Error(err));
+    });
+
+    return defer.promise;
+};
+
+VKClient.prototype.ensureToken = function () {
+    var self = this;
+
+    if (self.token && self.expires - now() > REFRESH_THRESHOLD) {
+        return libQ.resolve({ token: self.token, expires: self.expires });
+    }
+    return self.refresh();
+};
+
+VKClient.prototype.request = function (method, params) {
+    var self = this;
+    var defer = libQ.defer();
+
+    // kew does not chain foreign thenables, so the axios call is nested
+    // rather than returned from the handler.
+    self.ensureToken().then(function () {
+        var query = querystring.stringify({
+            v: API_VERSION,
+            access_token: self.token,
+            lang: 'ru',
+            client_id: APP_ID
+        });
+        axios({
+            method: 'post',
+            url: API_BASE + method + '?' + query,
+            headers: {
+                'content-type': 'application/x-www-form-urlencoded',
+                'user-agent': USER_AGENT
+            },
+            data: querystring.stringify(params || {})
+        }).then(function (resp) {
+            var data = resp.data;
+            if (!data || data.error) {
+                defer.reject(new Error('VK API ' + method + ': ' + ((data && data.error && data.error.error_msg) || 'unknown error')));
+                return;
+            }
+            defer.resolve(data.response);
+        }).catch(function (err) {
+            defer.reject(new Error(err));
+        });
+    }).fail(function (err) {
+        defer.reject(new Error(err));
+    });
+
+    return defer.promise;
+};
+
+// The catalogue root: the list of sections plus, with needBlocks, the VK Mix
+// entries, the user's playlists and the recently played tracks.
+VKClient.prototype.getSections = function (ownerId, needBlocks) {
+    return this.request('catalog.getAudio', {
+        owner_id: ownerId,
+        need_blocks: needBlocks ? '1' : undefined
+    });
+};
+
+VKClient.prototype.getSection = function (sectionId, startFrom) {
+    return this.request('catalog.getSection', {
+        section_id: sectionId,
+        start_from: startFrom
+    });
+};
+
+VKClient.prototype.search = function (query, offset) {
+    return this.request('audio.search', {
+        q: query,
+        offset: (offset === undefined) ? undefined : String(offset)
+    });
+};
+
+// VK has no separate "like" - a liked track is simply one added to My music,
+// which is what the heart in the web player toggles.
+VKClient.prototype.add = function (ownerId, audioId) {
+    return this.request('audio.add', {
+        owner_id: String(ownerId),
+        audio_id: String(audioId)
+    });
+};
+
+VKClient.prototype.remove = function (ownerId, audioId) {
+    return this.request('audio.delete', {
+        owner_id: String(ownerId),
+        audio_id: String(audioId)
+    });
+};
+
+module.exports = {
+    VKClient: VKClient,
+    m3u8ToMp3: m3u8ToMp3
+};
