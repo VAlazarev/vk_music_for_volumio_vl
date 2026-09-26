@@ -74,11 +74,27 @@ function mp3Candidates(url) {
     return candidates;
 }
 
+// Header values must be latin1; a value pasted wrong (cyrillic placeholder
+// text, a stray newline) otherwise blows up deep inside http with a message
+// that says nothing about which cookie is at fault.
+function checkCookie(name, value) {
+    if (!value) {
+        return '';
+    }
+    for (var i = 0; i < value.length; i++) {
+        if (value.charCodeAt(i) > 255) {
+            throw new Error('cookie "' + name + '" содержит недопустимый символ в позиции ' + i +
+                            ' - похоже, вставлено не то значение');
+        }
+    }
+    return value.trim();
+}
+
 function VKClient(cookieP, remixsid, logger) {
     var self = this;
 
-    self.cookieP = cookieP;
-    self.remixsid = remixsid;
+    self.cookieP = checkCookie('p', cookieP);
+    self.remixsid = checkCookie('remixsid', remixsid);
     self.logger = logger;
     self.token = '';
     self.expires = 0;
@@ -91,6 +107,17 @@ VKClient.prototype.refresh = function () {
     var self = this;
     var defer = libQ.defer();
 
+    // p lives on login.vk.ru, remixsid on vk.ru. Send whichever we have -
+    // whether p is genuinely required is worth finding out rather than
+    // assuming.
+    var cookies = [];
+    if (self.cookieP) {
+        cookies.push('p=' + self.cookieP);
+    }
+    if (self.remixsid) {
+        cookies.push('remixsid=' + self.remixsid);
+    }
+
     axios({
         method: 'post',
         url: AUTH_URL,
@@ -99,7 +126,7 @@ VKClient.prototype.refresh = function () {
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://vk.ru',
             'referer': 'https://vk.ru/',
-            'cookie': 'p=' + self.cookieP + '; remixsid=' + self.remixsid
+            'cookie': cookies.join('; ')
         },
         data: querystring.stringify({ version: '1', app_id: APP_ID })
     }).then(function (resp) {

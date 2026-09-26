@@ -61,7 +61,15 @@ if (!cookies) {
     process.exit(1);
 }
 
-var client = new vk.VKClient(cookies.p, cookies.remixsid, console);
+var client;
+try {
+    client = new vk.VKClient(cookies.p, cookies.remixsid, console);
+} catch (e) {
+    // A bad p should not stop us finding out whether p is needed at all.
+    console.log('ВНИМАНИЕ: ' + e.message);
+    console.log('Пробую только с remixsid, без p.\n');
+    client = new vk.VKClient('', cookies.remixsid, console);
+}
 
 console.log('1. Обмен cookie на токен...');
 client.refresh().then(function (token) {
